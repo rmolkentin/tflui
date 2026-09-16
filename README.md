@@ -22,7 +22,7 @@ for people who juggle multiple active testflinger reservations.
 
 1. Clone the repo:
    ```sh
-   git clone <your-repo-url> tflui && cd tflui
+   git clone https://github.com/rmolkentin/tflui tflui && cd tflui
    ```
 2. Make it executable and link it onto your `PATH`:
    ```sh
