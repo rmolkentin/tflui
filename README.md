@@ -37,7 +37,7 @@ Then authenticate once with your own testflinger credentials:
 tflui add-token
 ```
 
-For the support-team queue, use the `support-team` queue and the
+For the support-team queue when adding the token use the client id `support-team` and the
 corresponding secret key.
 
 ## Requirements
