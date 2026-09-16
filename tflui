@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""tflui - a thin wrapper around testflinger-cli.
+
+`tflui list` (alias: no args) lists your active testflinger reservations in
+an `lxc list`-style table, showing the agent, device IP, and how much lease
+time is left before the reservation expires.
+
+`tflui ssh [target]` ssh's into a reserved device, matching `target` against
+a job id (or prefix) or agent name. If omitted and only one reservation is
+active, that one is used.
+"""
+import argparse
+import configparser
+import datetime
+import getpass
+import json
+import os
+import pathlib
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+
+TFL = "testflinger-cli"
+HISTORY_FILE = pathlib.Path(
+    "~/snap/testflinger-cli/current/.config/testflinger-cli-history.json"
+).expanduser()
+AUTH_FILE = pathlib.Path(
+    "~/snap/testflinger-cli/current/.config/testflinger-cli-auth.conf"
+).expanduser()
+
+
+def run_tfl(*args):
+    result = subprocess.run(
+        [TFL, *args], capture_output=True, text=True, check=False
+    )
+    return result.returncode, result.stdout, result.stderr
+
+
+def get_job_ids():
+    """Return job ids known to the local testflinger-cli history.
+
+    Reads the history file directly to avoid a slow network round trip
+    through `testflinger-cli jobs`, falling back to the CLI if unavailable.
+    """
+    try:
+        history = json.loads(HISTORY_FILE.read_text())
+        return list(history.keys())
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    rc, out, err = run_tfl("jobs")
+    if rc != 0:
+        print(err.strip() or "failed to list testflinger jobs", file=sys.stderr)
+        sys.exit(1)
+
+    job_ids = []
+    for line in out.splitlines():
+        job_id = line.split()[0] if line.strip() else ""
+        if len(job_id) == 36 and job_id.count("-") == 4:
+            job_ids.append(job_id)
+    return job_ids
+
+
+def get_job_results(job_id):
+    rc, out, _ = run_tfl("results", job_id)
+    if rc != 0:
+        return {}
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return {}
+
+
+def parse_expiry(reserve_output):
+    """Extract the reservation expiry timestamp from reserve_output text."""
+    marker = "Reservation expires at: ["
+    idx = reserve_output.find(marker)
+    if idx == -1:
+        return None
+    start = idx + len(marker)
+    end = reserve_output.find("]", start)
+    if end == -1:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(reserve_output[start:end])
+    except ValueError:
+        return None
+
+
+def format_timedelta(delta):
+    total_seconds = int(delta.total_seconds())
+    if total_seconds <= 0:
+        return "expired"
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, _ = divmod(remainder, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return "".join(parts)
+
+
+def print_table(rows):
+    headers = ["JOB ID", "STATE", "AGENT", "IPV4", "TIME LEFT"]
+    columns = [headers] + rows
+    widths = [max(len(str(row[i])) for row in columns) for i in range(len(headers))]
+
+    def sep():
+        return "+" + "+".join("-" * (w + 2) for w in widths) + "+"
+
+    def fmt_row(row):
+        cells = [f" {str(row[i]).ljust(widths[i])} " for i in range(len(row))]
+        return "|" + "|".join(cells) + "|"
+
+    print(sep())
+    print(fmt_row(headers))
+    print(sep())
+    for row in rows:
+        print(fmt_row(row))
+    print(sep())
+
+
+def get_active_reservations():
+    """Return info dicts for jobs currently in the reserve state."""
+    job_ids = get_job_ids()
+    if not job_ids:
+        return []
+
+    # results calls are network round trips; fetch them concurrently
+    with ThreadPoolExecutor(max_workers=min(len(job_ids), 16)) as pool:
+        all_results = list(pool.map(get_job_results, job_ids))
+
+    reservations = []
+    for job_id, results in zip(job_ids, all_results):
+        state = results.get("job_state", "unknown")
+        if state not in ("reserve", "reserved"):
+            continue
+
+        device_info = results.get("device_info", {}) or {}
+        agent = device_info.get("agent_name", "-")
+        ipv4 = device_info.get("device_ip", "-")
+
+        expiry = parse_expiry(results.get("reserve_output", "") or "")
+        if expiry is not None:
+            now = datetime.datetime.now(expiry.tzinfo)
+            time_left = format_timedelta(expiry - now)
+        else:
+            time_left = "-"
+
+        reservations.append(
+            {
+                "job_id": job_id,
+                "state": state,
+                "agent": agent,
+                "ipv4": ipv4,
+                "time_left": time_left,
+            }
+        )
+    return reservations
+
+
+def cmd_list(_args):
+    reservations = get_active_reservations()
+    if not reservations:
+        print("No active (reserved) testflinger jobs found.")
+        return
+
+    rows = [
+        [r["job_id"], r["state"], r["agent"], r["ipv4"], r["time_left"]]
+        for r in reservations
+    ]
+    print_table(rows)
+
+
+def find_reservation(target, reservations):
+    """Match target against a job id or agent name (exact or prefix)."""
+    matches = [
+        r
+        for r in reservations
+        if r["job_id"] == target
+        or r["agent"] == target
+        or r["job_id"].startswith(target)
+        or r["agent"].startswith(target)
+    ]
+    return matches
+
+
+def cmd_ssh(args):
+    reservations = get_active_reservations()
+    if not reservations:
+        print("No active (reserved) testflinger jobs found.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.target is None:
+        if len(reservations) > 1:
+            print(
+                "Multiple active reservations found, specify a job id or agent:",
+                file=sys.stderr,
+            )
+            for r in reservations:
+                print(f"  {r['job_id']}  {r['agent']}", file=sys.stderr)
+            sys.exit(1)
+        match = reservations[0]
+    else:
+        matches = find_reservation(args.target, reservations)
+        if not matches:
+            print(f"No active reservation matches '{args.target}'", file=sys.stderr)
+            sys.exit(1)
+        if len(matches) > 1:
+            print(f"'{args.target}' is ambiguous, matches:", file=sys.stderr)
+            for r in matches:
+                print(f"  {r['job_id']}  {r['agent']}", file=sys.stderr)
+            sys.exit(1)
+        match = matches[0]
+
+    if match["ipv4"] in ("-", "", None):
+        print(f"No device IP known for job {match['job_id']}", file=sys.stderr)
+        sys.exit(1)
+
+    ssh_args = [
+        "ssh",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        f"{args.user}@{match['ipv4']}",
+        *args.ssh_args,
+    ]
+    os.execvp("ssh", ssh_args)
+
+
+def cmd_add_token(args):
+    """Store a personal testflinger client-id/secret-key via testflinger-cli login."""
+    client_id = args.client_id or input("Testflinger client id: ").strip()
+    secret_key = args.secret_key or getpass.getpass("Testflinger secret key: ")
+
+    if not client_id or not secret_key:
+        print("Both a client id and secret key are required.", file=sys.stderr)
+        sys.exit(1)
+
+    rc, out, err = run_tfl("login", "--client-id", client_id, "--secret-key", secret_key)
+    if rc != 0:
+        print(err.strip() or out.strip() or "failed to log in", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Token stored for client id '{client_id}'.")
+
+
+def cmd_token_status(_args):
+    if not AUTH_FILE.exists():
+        print("No token stored yet. Run: tflui add-token")
+        return
+
+    config = configparser.ConfigParser()
+    config.read(AUTH_FILE)
+    client_id = config.get("AUTH", "client_id", fallback="unknown")
+    print(f"Token stored for client id '{client_id}' ({AUTH_FILE}).")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="tflui", description="A friendlier wrapper around testflinger-cli"
+    )
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.add_parser("list", help="List active testflinger reservations")
+
+    ssh_parser = subparsers.add_parser(
+        "ssh", help="SSH into a reserved testflinger device"
+    )
+    ssh_parser.add_argument(
+        "target",
+        nargs="?",
+        help="Job id (or prefix) or agent name to ssh into; "
+        "omit if you only have one active reservation",
+    )
+    ssh_parser.add_argument("-u", "--user", default="ubuntu", help="SSH user (default: ubuntu)")
+    ssh_parser.add_argument(
+        "ssh_args", nargs=argparse.REMAINDER, help="Extra arguments passed to ssh"
+    )
+
+    add_token_parser = subparsers.add_parser(
+        "add-token",
+        help="Store your personal testflinger client-id/secret-key",
+    )
+    add_token_parser.add_argument("--client-id", help="Testflinger client id")
+    add_token_parser.add_argument("--secret-key", help="Testflinger secret key")
+
+    subparsers.add_parser("token-status", help="Show which client id has a token stored")
+
+    args = parser.parse_args()
+    if args.command == "ssh":
+        cmd_ssh(args)
+    elif args.command == "add-token":
+        cmd_add_token(args)
+    elif args.command == "token-status":
+        cmd_token_status(args)
+    elif args.command in (None, "list"):
+        cmd_list(args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
