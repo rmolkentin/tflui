@@ -13,20 +13,30 @@ import argparse
 import configparser
 import datetime
 import getpass
+import re
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
 TFL = "testflinger-cli"
+DEFAULT_LEASE = os.environ.get("TFLUI_LEASE", "14d")
+DEFAULT_QUEUE = os.environ.get("TFLUI_QUEUE", "support-team")
+DEFAULT_DISTRO = os.environ.get("TFLUI_DISTRO", "noble")
+DEFAULT_TIMEOUT = int(os.environ.get("TFLUI_TIMEOUT", "1206900"))
+DEFAULT_KEY = os.environ.get("TFLUI_KEY")
 HISTORY_FILE = pathlib.Path(
     "~/snap/testflinger-cli/current/.config/testflinger-cli-history.json"
 ).expanduser()
 AUTH_FILE = pathlib.Path(
     "~/snap/testflinger-cli/current/.config/testflinger-cli-auth.conf"
 ).expanduser()
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+JOB_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+DURATION_RE = re.compile(r"(\d+)([smhdw]?)")
 
 
 def run_tfl(*args):
@@ -103,8 +113,32 @@ def format_timedelta(delta):
     return "".join(parts)
 
 
-def print_table(rows):
-    headers = ["JOB ID", "STATE", "AGENT", "IPV4", "TIME LEFT"]
+def parse_duration(value):
+    value = str(value).strip().lower()
+    if not value:
+        raise ValueError("empty duration")
+
+    multipliers = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+    total = 0
+    position = 0
+    for match in DURATION_RE.finditer(value):
+        if match.start() != position:
+            raise ValueError(value)
+        amount, unit = match.groups()
+        total += int(amount) * multipliers[unit]
+        position = match.end()
+
+    if position != len(value) or total <= 0:
+        raise ValueError(value)
+    return total
+
+
+def format_duration(seconds):
+    return format_timedelta(datetime.timedelta(seconds=seconds))
+
+
+def print_table(rows, headers=None):
+    headers = headers or ["JOB ID", "STATE", "AGENT", "IPV4", "TIME LEFT"]
     columns = [headers] + rows
     widths = [max(len(str(row[i])) for row in columns) for i in range(len(headers))]
 
@@ -121,6 +155,95 @@ def print_table(rows):
     for row in rows:
         print(fmt_row(row))
     print(sep())
+
+
+def parse_agents(output, queue):
+    agents = []
+    for raw_line in output.splitlines():
+        line = ANSI_RE.sub("", raw_line).strip()
+        if not line or line.startswith("NAME") or line.startswith("WARNING:"):
+            continue
+
+        parts = re.split(r"\s{2,}", line, maxsplit=5)
+        if len(parts) < 5:
+            continue
+
+        name, status, location, provision_type = parts[:4]
+        if len(parts) == 6 and JOB_ID_RE.match(parts[4]):
+            job_id = parts[4]
+            queue_text = parts[5]
+        else:
+            job_id = "-"
+            queue_text = parts[4]
+
+        tokens = [token.strip() for token in queue_text.split(",") if token.strip()]
+        model = tokens[2] if len(tokens) > 2 else "-"
+        tags = [token for token in tokens[3:] if token != queue]
+        agents.append(
+            {
+                "name": name,
+                "status": status,
+                "location": location,
+                "provision_type": provision_type,
+                "job_id": job_id,
+                "model": model,
+                "tags": ", ".join(tags) or "-",
+            }
+        )
+    return agents
+
+
+def cmd_machines(args):
+    tfl_args = [
+        "list-agents",
+        "--filter-queues",
+        args.queue,
+        "--fields",
+        "name,status,location,provision_type,job_id,queues",
+    ]
+    if not args.all:
+        tfl_args.extend(["--filter-status", "waiting"])
+
+    rc, out, err = run_tfl(*tfl_args)
+    if rc != 0:
+        print(err.strip() or "failed to list testflinger agents", file=sys.stderr)
+        sys.exit(1)
+
+    agents = parse_agents(out, args.queue)
+    if not agents:
+        availability = "" if args.all else " available"
+        print(f"No{availability} machines found in queue '{args.queue}'.")
+        return
+
+    rows = [
+        [
+            agent["name"],
+            agent["status"],
+            agent["model"],
+            agent["tags"],
+            agent["location"],
+            agent["provision_type"],
+            agent["job_id"],
+        ]
+        for agent in agents
+    ]
+    print_table(rows, ["NAME", "STATUS", "MODEL", "TAGS", "LOCATION", "PROVISION", "JOB ID"])
+
+
+def get_available_machines(queue):
+    rc, out, err = run_tfl(
+        "list-agents",
+        "--filter-queues",
+        queue,
+        "--filter-status",
+        "waiting",
+        "--fields",
+        "name,status,location,provision_type,job_id,queues",
+    )
+    if rc != 0:
+        print(err.strip() or "failed to list testflinger agents", file=sys.stderr)
+        return []
+    return parse_agents(out, queue)
 
 
 def get_active_reservations():
@@ -232,6 +355,49 @@ def cmd_ssh(args):
     os.execvp("ssh", ssh_args)
 
 
+def resolve_reservation(target, reservations):
+    if target is None:
+        if len(reservations) > 1:
+            print(
+                "Multiple active reservations found, specify a job id or agent:",
+                file=sys.stderr,
+            )
+            for r in reservations:
+                print(f"  {r['job_id']}  {r['agent']}", file=sys.stderr)
+            sys.exit(1)
+        return reservations[0]
+
+    matches = find_reservation(target, reservations)
+    if not matches:
+        print(f"No active reservation matches '{target}'", file=sys.stderr)
+        sys.exit(1)
+    if len(matches) > 1:
+        print(f"'{target}' is ambiguous, matches:", file=sys.stderr)
+        for r in matches:
+            print(f"  {r['job_id']}  {r['agent']}", file=sys.stderr)
+        sys.exit(1)
+    return matches[0]
+
+
+def cmd_release(args):
+    reservations = get_active_reservations()
+    if not reservations:
+        print("No active (reserved) testflinger jobs found.", file=sys.stderr)
+        sys.exit(1)
+
+    match = resolve_reservation(args.target, reservations)
+    print(f"Release {match['agent']} ({match['job_id']}) with {match['time_left']} left.")
+    if not args.yes and not prompt_yes_no("Release reservation", False):
+        print("Cancelled.")
+        return
+
+    rc, out, err = run_tfl("cancel", match["job_id"])
+    if rc != 0:
+        print(err.strip() or out.strip() or "failed to release reservation", file=sys.stderr)
+        sys.exit(1)
+    print(out.strip() or f"Released {match['agent']} ({match['job_id']}).")
+
+
 def cmd_add_token(args):
     """Store a personal testflinger client-id/secret-key via testflinger-cli login."""
     client_id = args.client_id or input("Testflinger client id: ").strip()
@@ -260,12 +426,136 @@ def cmd_token_status(_args):
     print(f"Token stored for client id '{client_id}' ({AUTH_FILE}).")
 
 
+def prompt_value(label, default=None):
+    suffix = f" [{default}]" if default not in (None, "") else ""
+    value = input(f"{label}{suffix}: ").strip()
+    return value if value else default
+
+
+def prompt_yes_no(label, default=True):
+    suffix = "Y/n" if default else "y/N"
+    value = input(f"{label} [{suffix}]: ").strip().lower()
+    if not value:
+        return default
+    return value in ("y", "yes")
+
+
+def choose_machine(queue):
+    machines = get_available_machines(queue)
+    if machines:
+        print("Available machines:")
+        for index, machine in enumerate(machines, start=1):
+            tags = "" if machine["tags"] == "-" else f" ({machine['tags']})"
+            print(f"  {index}. {machine['name']} - {machine['model']}{tags}")
+    else:
+        print(f"No available machines found in queue '{queue}'; random is still allowed.")
+
+    choice = prompt_value("Machine name or number", "random")
+    if choice in (None, "", "random"):
+        return None
+    if choice.isdigit() and machines:
+        index = int(choice)
+        if 1 <= index <= len(machines):
+            return machines[index - 1]["name"]
+    return choice
+
+
+def interactive_launch(args):
+    print("Configure a Testflinger reservation. Press Enter to accept defaults.")
+    args.queue = prompt_value("Queue", args.queue)
+    args.machine = choose_machine(args.queue)
+    args.distro = prompt_value("Distro", args.distro)
+    args.lease = prompt_value("Lease time (examples: 2h, 1d, 14d)", DEFAULT_LEASE)
+    args.key = []
+    key_default = DEFAULT_KEY or "lp:<your-launchpad-id>"
+    key = prompt_value("SSH key to inject", key_default)
+    if key:
+        args.key.append(key)
+    args.ephemeral = prompt_yes_no("Use MAAS ephemeral deployment", args.ephemeral)
+
+    queue = args.machine or args.queue
+    timeout = parse_duration(args.lease)
+    print()
+    print(f"Queue:      {queue}{' (specific machine)' if args.machine else ''}")
+    print(f"Distro:     {args.distro}")
+    print(f"Lease time: {format_duration(timeout)}")
+    print(f"SSH keys:   {', '.join(args.key)}")
+    if args.ephemeral:
+        print("Ephemeral:  yes")
+    print()
+    if not prompt_yes_no("Submit reservation", True):
+        print("Cancelled.")
+        sys.exit(0)
+
+
+def cmd_launch(args):
+    if args.interactive:
+        interactive_launch(args)
+
+    keys = args.key or ([DEFAULT_KEY] if DEFAULT_KEY else [])
+    if not keys:
+        key = input("SSH key to inject (example: lp:your-launchpad-id or gh:your-github-id): ").strip()
+        if key:
+            keys.append(key)
+
+    if not keys:
+        print("At least one SSH key is required to launch a usable reservation.", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        timeout = parse_duration(args.lease) if args.lease else args.timeout
+    except ValueError:
+        print(f"Invalid lease time '{args.lease}'. Use values like 3600, 2h, 1d, or 1w.", file=sys.stderr)
+        sys.exit(1)
+
+    queue = args.machine if args.machine and args.machine != "random" else args.queue
+
+    reserve_args = [
+        TFL,
+        "reserve",
+        "--queue",
+        queue,
+        "--distro",
+        args.distro,
+        "--timeout",
+        str(timeout),
+        "--yes",
+    ]
+    if args.ephemeral:
+        reserve_args.append("--ephemeral")
+    if args.dry_run:
+        reserve_args.append("--dry-run")
+    for key in keys:
+        reserve_args.extend(["--key", key])
+
+    sys.exit(subprocess.run(reserve_args, check=False).returncode)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="tflui", description="A friendlier wrapper around testflinger-cli"
     )
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("list", help="List active testflinger reservations")
+
+    machines_parser = subparsers.add_parser(
+        "machines", help="List machines in a testflinger queue"
+    )
+    machines_parser.add_argument("-q", "--queue", default=DEFAULT_QUEUE, help=f"Queue name (default: {DEFAULT_QUEUE})")
+    machines_parser.add_argument("--all", action="store_true", help="Include busy and unavailable machines")
+
+    launch_parser = subparsers.add_parser(
+        "launch", help="Quick launch a reserved testflinger instance"
+    )
+    launch_parser.add_argument("-q", "--queue", default=DEFAULT_QUEUE, help=f"Queue name (default: {DEFAULT_QUEUE})")
+    launch_parser.add_argument("-m", "--machine", help="Specific machine to reserve, or 'random' (default)")
+    launch_parser.add_argument("--distro", default=DEFAULT_DISTRO, help=f"Distro to provision (default: {DEFAULT_DISTRO})")
+    launch_parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help=f"Reservation timeout in seconds (default: {DEFAULT_TIMEOUT})")
+    launch_parser.add_argument("--lease", help="Human-friendly lease time, e.g. 2h, 1d, 14d")
+    launch_parser.add_argument("-k", "--key", action="append", help="SSH key to inject, e.g. lp:userid or gh:userid")
+    launch_parser.add_argument("--ephemeral", action="store_true", help="Use a MAAS ephemeral deployment")
+    launch_parser.add_argument("--dry-run", action="store_true", help="Print the job data without submitting")
+    launch_parser.add_argument("--no-interactive", action="store_true", help="Use defaults/flags without prompts")
 
     ssh_parser = subparsers.add_parser(
         "ssh", help="SSH into a reserved testflinger device"
@@ -281,6 +571,17 @@ def main():
         "ssh_args", nargs=argparse.REMAINDER, help="Extra arguments passed to ssh"
     )
 
+    release_parser = subparsers.add_parser(
+        "release", help="Release a reserved testflinger device early"
+    )
+    release_parser.add_argument(
+        "target",
+        nargs="?",
+        help="Job id (or prefix) or agent name to release; "
+        "omit if you only have one active reservation",
+    )
+    release_parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
+
     add_token_parser = subparsers.add_parser(
         "add-token",
         help="Store your personal testflinger client-id/secret-key",
@@ -291,8 +592,17 @@ def main():
     subparsers.add_parser("token-status", help="Show which client id has a token stored")
 
     args = parser.parse_args()
-    if args.command == "ssh":
+    if args.command == "launch":
+        args.interactive = len(sys.argv) == 2 and sys.stdin.isatty() and not args.no_interactive
+
+    if args.command == "machines":
+        cmd_machines(args)
+    elif args.command == "launch":
+        cmd_launch(args)
+    elif args.command == "ssh":
         cmd_ssh(args)
+    elif args.command == "release":
+        cmd_release(args)
     elif args.command == "add-token":
         cmd_add_token(args)
     elif args.command == "token-status":
