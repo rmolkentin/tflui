@@ -24,7 +24,9 @@ for people who juggle multiple active testflinger reservations.
 - `tflui add-token` - store your personal testflinger client-id/secret-key
   (prompts securely if not passed via `--client-id`/`--secret-key`). This
   delegates to `testflinger-cli login`, so each user authenticates with
-  their own credentials instead of a shared secret.
+  their own credentials instead of a shared secret. Credentials are saved for
+  future CLI authentication so the six-day refresh-token expiry does not
+  require running `add-token` again.
 - `tflui token-status` - show which client id currently has a token stored.
 
 ## Launch options
@@ -63,7 +65,13 @@ Then authenticate once with your own testflinger credentials:
 tflui add-token
 ```
 
-For the support-team queue when adding the token use the client id `support-team` and the
+The client ID and secret key are stored in
+`$XDG_CONFIG_HOME/tflui/credentials.conf`
+(default: `~/.config/tflui/credentials.conf`) with owner-only permissions.
+The file contains plaintext credentials, so protect access to your user
+account and delete the file to remove the saved credentials.
+
+For the support-team queue, use the client ID `support-team` and the
 corresponding secret key.
 
 ## Requirements

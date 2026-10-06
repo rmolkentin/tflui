@@ -28,6 +28,10 @@ DEFAULT_QUEUE = os.environ.get("TFLUI_QUEUE", "support-team")
 DEFAULT_DISTRO = os.environ.get("TFLUI_DISTRO", "noble")
 DEFAULT_TIMEOUT = int(os.environ.get("TFLUI_TIMEOUT", "1206900"))
 DEFAULT_KEY = os.environ.get("TFLUI_KEY")
+CONFIG_DIR = pathlib.Path(
+    os.environ.get("XDG_CONFIG_HOME", "~/.config")
+).expanduser() / "tflui"
+CREDENTIALS_FILE = CONFIG_DIR / "credentials.conf"
 HISTORY_FILE = pathlib.Path(
     "~/snap/testflinger-cli/current/.config/testflinger-cli-history.json"
 ).expanduser()
@@ -40,10 +44,52 @@ DURATION_RE = re.compile(r"(\d+)([smhdw]?)")
 
 
 def run_tfl(*args):
+    env = os.environ.copy()
+    if (
+        "TESTFLINGER_CLIENT_ID" not in env
+        and "TESTFLINGER_SECRET_KEY" not in env
+    ):
+        credentials = load_credentials()
+        if credentials:
+            env["TESTFLINGER_CLIENT_ID"] = credentials[0]
+            env["TESTFLINGER_SECRET_KEY"] = credentials[1]
+
     result = subprocess.run(
-        [TFL, *args], capture_output=True, text=True, check=False
+        [TFL, *args], capture_output=True, text=True, check=False, env=env
     )
     return result.returncode, result.stdout, result.stderr
+
+
+def load_credentials():
+    config = configparser.ConfigParser(interpolation=None)
+    try:
+        with CREDENTIALS_FILE.open() as credential_file:
+            config.read_file(credential_file)
+    except FileNotFoundError:
+        return None
+    except (OSError, configparser.Error) as exc:
+        print(f"Unable to read saved credentials: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    client_id = config.get("AUTH", "client_id", fallback="")
+    secret_key = config.get("AUTH", "secret_key", fallback="")
+    if client_id and secret_key:
+        return client_id, secret_key
+    return None
+
+
+def store_credentials(client_id, secret_key):
+    config = configparser.ConfigParser(interpolation=None)
+    config["AUTH"] = {"client_id": client_id, "secret_key": secret_key}
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(CONFIG_DIR, 0o700)
+        with CREDENTIALS_FILE.open("w") as credential_file:
+            config.write(credential_file)
+        os.chmod(CREDENTIALS_FILE, 0o600)
+    except OSError as exc:
+        print(f"Unable to securely save credentials: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 def get_job_ids():
@@ -412,18 +458,26 @@ def cmd_add_token(args):
         print(err.strip() or out.strip() or "failed to log in", file=sys.stderr)
         sys.exit(1)
 
+    store_credentials(client_id, secret_key)
     print(f"Token stored for client id '{client_id}'.")
 
 
 def cmd_token_status(_args):
-    if not AUTH_FILE.exists():
+    credentials = load_credentials()
+    if not AUTH_FILE.exists() and not credentials:
         print("No token stored yet. Run: tflui add-token")
         return
 
-    config = configparser.ConfigParser()
-    config.read(AUTH_FILE)
-    client_id = config.get("AUTH", "client_id", fallback="unknown")
-    print(f"Token stored for client id '{client_id}' ({AUTH_FILE}).")
+    if AUTH_FILE.exists():
+        config = configparser.ConfigParser()
+        config.read(AUTH_FILE)
+        client_id = config.get("AUTH", "client_id", fallback="unknown")
+        print(f"Token stored for client id '{client_id}' ({AUTH_FILE}).")
+    if credentials:
+        print(
+            f"Credentials saved for client id '{credentials[0]}' "
+            f"({CREDENTIALS_FILE})."
+        )
 
 
 def prompt_value(label, default=None):
