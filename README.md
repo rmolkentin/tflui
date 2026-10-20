@@ -18,6 +18,9 @@ for people who juggle multiple active testflinger reservations.
   id (or prefix) or agent name; if omitted and you only have one active
   reservation, that one is used. Extra args after `--` are passed to `ssh`
   (e.g. to run a remote command instead of an interactive shell).
+- `tflui deploy juju [target]` - deploy Juju on an already-launched reserved
+  device using the local bastion bootstrap script. Target selection works
+  like `ssh`; omit the target only when one reservation is active.
 - `tflui release [target]` - release a reserved device early. `target` matches
   a job id (or prefix) or agent name; if omitted and you only have one active
   reservation, that one is used. Use `-y`/`--yes` to skip confirmation.
@@ -45,6 +48,42 @@ for people who juggle multiple active testflinger reservations.
 
 Defaults can be overridden with `TFLUI_QUEUE`, `TFLUI_DISTRO`, `TFLUI_TIMEOUT`,
 `TFLUI_LEASE`, and `TFLUI_KEY`.
+
+The default lease is `13d23h15m` (`1206900` seconds). For `support-team`,
+longer requests (including `--lease 14d` or an explicit `--timeout`) are
+shortened to this conservative limit with a warning: a full 14 days is
+`1209600` seconds and can be rejected by the server's reservation permissions.
+This limit also applies when selecting a specific machine with `--machine`
+under `--queue support-team`. Other queues retain the requested duration;
+their limits are enforced by the server.
+
+## Deploy Juju
+
+After launching a machine and waiting for it to appear in `tflui list` as
+reserved, deploy to its agent name or job id (prefixes are accepted):
+
+```sh
+tflui deploy juju machine-name
+```
+
+The command reads `~/lab/testflinger/bastion-bootstrap.sh` on your local
+machine and streams it over SSH to `sudo -n bash -s` on the selected device.
+The script installs Juju and LXD and bootstraps a local LXD cloud controller
+named `bastion-controller` for the remote `ubuntu` user. It must exist locally;
+it does not need to be copied to the device first.
+
+The SSH user defaults to `ubuntu` and must have passwordless sudo access.
+The bootstrap script also requires the remote `ubuntu` account to exist,
+even when using a different SSH user. Override the local script or SSH user
+when needed:
+
+```sh
+tflui deploy juju machine-name --script /path/to/bootstrap.sh --user ubuntu
+```
+
+Deployment output streams to your terminal, and SSH or bootstrap failures
+produce a nonzero exit status. Deployment is explicit: `launch` does not
+automatically run the bootstrap script.
 
 ## Install
 
@@ -78,3 +117,4 @@ corresponding secret key.
 
 - Python 3
 - `testflinger-cli` (installed and configured, e.g. via `snap install testflinger-cli`)
+- OpenSSH client for `ssh` and `deploy`

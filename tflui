@@ -23,11 +23,13 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 TFL = "testflinger-cli"
-DEFAULT_LEASE = os.environ.get("TFLUI_LEASE", "14d")
+SUPPORT_TEAM_TIMEOUT_LIMIT = 1206900
+DEFAULT_LEASE = os.environ.get("TFLUI_LEASE", "13d23h15m")
 DEFAULT_QUEUE = os.environ.get("TFLUI_QUEUE", "support-team")
 DEFAULT_DISTRO = os.environ.get("TFLUI_DISTRO", "noble")
-DEFAULT_TIMEOUT = int(os.environ.get("TFLUI_TIMEOUT", "1206900"))
+DEFAULT_TIMEOUT = int(os.environ.get("TFLUI_TIMEOUT", str(SUPPORT_TEAM_TIMEOUT_LIMIT)))
 DEFAULT_KEY = os.environ.get("TFLUI_KEY")
+DEFAULT_JUJU_SCRIPT = "~/lab/testflinger/bastion-bootstrap.sh"
 CONFIG_DIR = pathlib.Path(
     os.environ.get("XDG_CONFIG_HOME", "~/.config")
 ).expanduser() / "tflui"
@@ -425,6 +427,38 @@ def resolve_reservation(target, reservations):
     return matches[0]
 
 
+def cmd_deploy(args):
+    reservations = get_active_reservations()
+    if not reservations:
+        print("No active (reserved) testflinger jobs found.", file=sys.stderr)
+        sys.exit(1)
+
+    match = resolve_reservation(args.target, reservations)
+    if match["ipv4"] in ("-", "", None):
+        print(f"No device IP known for job {match['job_id']}", file=sys.stderr)
+        sys.exit(1)
+
+    script = pathlib.Path(args.script).expanduser()
+    ssh_args = [
+        "ssh",
+        "-T",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        f"{args.user}@{match['ipv4']}",
+        "sudo -n bash -s",
+    ]
+    try:
+        with script.open("rb") as bootstrap:
+            print(f"Deploying Juju on {match['agent']} ({match['job_id']}) using {script}.", flush=True)
+            result = subprocess.run(ssh_args, stdin=bootstrap, check=False)
+    except OSError as exc:
+        print(f"Unable to deploy Juju: {exc}", file=sys.stderr)
+        sys.exit(1)
+    sys.exit(result.returncode)
+
+
 def cmd_release(args):
     reservations = get_active_reservations()
     if not reservations:
@@ -514,6 +548,20 @@ def choose_machine(queue):
     return choice
 
 
+def launch_timeout(args, warn=False):
+    timeout = parse_duration(args.lease) if args.lease else args.timeout
+    if args.queue == "support-team" and timeout > SUPPORT_TEAM_TIMEOUT_LIMIT:
+        if warn:
+            print(
+                f"Requested lease {format_duration(timeout)} exceeds the safe support-team "
+                f"limit; using {format_duration(SUPPORT_TEAM_TIMEOUT_LIMIT)} "
+                f"({SUPPORT_TEAM_TIMEOUT_LIMIT} seconds) instead.",
+                file=sys.stderr,
+            )
+        return SUPPORT_TEAM_TIMEOUT_LIMIT
+    return timeout
+
+
 def interactive_launch(args):
     print("Configure a Testflinger reservation. Press Enter to accept defaults.")
     args.queue = prompt_value("Queue", args.queue)
@@ -528,7 +576,7 @@ def interactive_launch(args):
     args.ephemeral = prompt_yes_no("Use MAAS ephemeral deployment", args.ephemeral)
 
     queue = args.machine or args.queue
-    timeout = parse_duration(args.lease)
+    timeout = launch_timeout(args, warn=True)
     print()
     print(f"Queue:      {queue}{' (specific machine)' if args.machine else ''}")
     print(f"Distro:     {args.distro}")
@@ -557,7 +605,7 @@ def cmd_launch(args):
         sys.exit(1)
 
     try:
-        timeout = parse_duration(args.lease) if args.lease else args.timeout
+        timeout = launch_timeout(args, warn=not args.interactive)
     except ValueError:
         print(f"Invalid lease time '{args.lease}'. Use values like 3600, 2h, 1d, or 1w.", file=sys.stderr)
         sys.exit(1)
@@ -625,6 +673,21 @@ def main():
         "ssh_args", nargs=argparse.REMAINDER, help="Extra arguments passed to ssh"
     )
 
+    deploy_parser = subparsers.add_parser(
+        "deploy", help="Deploy software on an already-reserved testflinger device"
+    )
+    deploy_parser.add_argument("software", choices=["juju"], help="Software to deploy")
+    deploy_parser.add_argument(
+        "target",
+        nargs="?",
+        help="Job id (or prefix) or agent name; omit if you only have one active reservation",
+    )
+    deploy_parser.add_argument("-u", "--user", default="ubuntu", help="SSH user (default: ubuntu)")
+    deploy_parser.add_argument(
+        "--script", default=DEFAULT_JUJU_SCRIPT,
+        help=f"Local Juju bootstrap script (default: {DEFAULT_JUJU_SCRIPT})",
+    )
+
     release_parser = subparsers.add_parser(
         "release", help="Release a reserved testflinger device early"
     )
@@ -655,6 +718,8 @@ def main():
         cmd_launch(args)
     elif args.command == "ssh":
         cmd_ssh(args)
+    elif args.command == "deploy":
+        cmd_deploy(args)
     elif args.command == "release":
         cmd_release(args)
     elif args.command == "add-token":
