@@ -29,7 +29,7 @@ DEFAULT_QUEUE = os.environ.get("TFLUI_QUEUE", "support-team")
 DEFAULT_DISTRO = os.environ.get("TFLUI_DISTRO", "noble")
 DEFAULT_TIMEOUT = int(os.environ.get("TFLUI_TIMEOUT", str(SUPPORT_TEAM_TIMEOUT_LIMIT)))
 DEFAULT_KEY = os.environ.get("TFLUI_KEY")
-DEFAULT_JUJU_SCRIPT = "~/lab/testflinger/bastion-bootstrap.sh"
+DEFAULT_JUJU_SCRIPT = str(pathlib.Path(__file__).resolve().with_name("bastion-bootstrap.sh"))
 CONFIG_DIR = pathlib.Path(
     os.environ.get("XDG_CONFIG_HOME", "~/.config")
 ).expanduser() / "tflui"

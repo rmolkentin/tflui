@@ -19,7 +19,7 @@ for people who juggle multiple active testflinger reservations.
   reservation, that one is used. Extra args after `--` are passed to `ssh`
   (e.g. to run a remote command instead of an interactive shell).
 - `tflui deploy juju [target]` - deploy Juju on an already-launched reserved
-  device using the local bastion bootstrap script. Target selection works
+  device using the bundled bastion bootstrap script. Target selection works
   like `ssh`; omit the target only when one reservation is active.
 - `tflui release [target]` - release a reserved device early. `target` matches
   a job id (or prefix) or agent name; if omitted and you only have one active
@@ -66,15 +66,15 @@ reserved, deploy to its agent name or job id (prefixes are accepted):
 tflui deploy juju machine-name
 ```
 
-The command reads `~/lab/testflinger/bastion-bootstrap.sh` on your local
-machine and streams it over SSH to `sudo -n bash -s` on the selected device.
+The command reads the bundled [bastion-bootstrap.sh](bastion-bootstrap.sh)
+beside the CLI and streams it over SSH to `sudo -n bash -s` on the selected device.
 The script installs Juju and LXD and bootstraps a local LXD cloud controller
-named `bastion-controller` for the remote `ubuntu` user. It must exist locally;
-it does not need to be copied to the device first.
+named `bastion-controller` for the remote `ubuntu` user. No separate
+testflinger checkout or manual copy to the device is needed.
 
 The SSH user defaults to `ubuntu` and must have passwordless sudo access.
 The bootstrap script also requires the remote `ubuntu` account to exist,
-even when using a different SSH user. Override the local script or SSH user
+even when using a different SSH user. Override the bundled script or SSH user
 when needed:
 
 ```sh

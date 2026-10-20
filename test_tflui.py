@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 import io
 import pathlib
+import tempfile
 import unittest
 from unittest import mock
 
@@ -100,6 +101,23 @@ class DeployTests(unittest.TestCase):
         parsed = deploy.call_args.args[0]
         self.assertEqual((parsed.software, parsed.target), ("juju", "abc"))
         self.assertEqual((parsed.script, parsed.user), ("/tmp/bootstrap.sh", "admin"))
+
+
+class BundledBootstrapTests(unittest.TestCase):
+    def test_default_script_is_bundled_with_cli(self):
+        script = pathlib.Path(tflui.DEFAULT_JUJU_SCRIPT)
+        self.assertEqual(script, pathlib.Path(tflui.__file__).resolve().with_name("bastion-bootstrap.sh"))
+        self.assertTrue(script.is_file())
+
+    def test_default_script_resolves_through_cli_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            link = pathlib.Path(directory) / "tflui"
+            link.symlink_to(pathlib.Path(tflui.__file__).resolve())
+            linked_loader = importlib.machinery.SourceFileLoader("linked_tflui", str(link))
+            linked_spec = importlib.util.spec_from_loader(linked_loader.name, linked_loader)
+            linked_module = importlib.util.module_from_spec(linked_spec)
+            linked_loader.exec_module(linked_module)
+            self.assertEqual(linked_module.DEFAULT_JUJU_SCRIPT, tflui.DEFAULT_JUJU_SCRIPT)
 
 
 class LaunchTests(unittest.TestCase):
